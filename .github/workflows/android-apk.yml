@@ -1,0 +1,56 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install packages
+        run: npm ci
+      - name: Build web app
+        run: npm run build
+      - name: Add Capacitor Android project
+        run: npx cap add android
+      - name: Add the cat app icon and sync
+        run: cp -R assets/android/res/. android/app/src/main/res/ && npx cap sync android
+      - name: Wait for the customer storefront deployment
+        run: |
+          for attempt in $(seq 1 36); do
+            if curl --fail --silent https://praktispraktis.vercel.app/api/shop/jomich >/dev/null; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "The customer shop API is not available on the deployed site yet."
+          exit 1
+      - name: Build installable APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+      - name: Publish APK for download
+        uses: actions/upload-artifact@v4
+        with:
+          name: jomich-petshop-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
