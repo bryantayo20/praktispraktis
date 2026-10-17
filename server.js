@@ -18,7 +18,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS transactions (id TEXT PRIMARY KEY, date TEXT NOT NULL, type TEXT NOT NULL, product TEXT NOT NULL, qty INTEGER NOT NULL, total REAL NOT NULL DEFAULT 0);
   CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK (id = 1), name TEXT NOT NULL, email TEXT NOT NULL, lowStock INTEGER NOT NULL DEFAULT 1, weekly INTEGER NOT NULL DEFAULT 1, emailAlerts INTEGER NOT NULL DEFAULT 1, push INTEGER NOT NULL DEFAULT 1);
   CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL UNIQUE COLLATE NOCASE, email TEXT UNIQUE COLLATE NOCASE, phone TEXT UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'owner', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+  CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL UNIQUE COLLATE NOCASE, email TEXT UNIQUE COLLATE NOCASE, phone TEXT UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'owner', store_owner_id TEXT REFERENCES users(id) ON DELETE CASCADE, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
   CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS account_products (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, name TEXT NOT NULL, detail TEXT NOT NULL, category TEXT NOT NULL, cost REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 0, min INTEGER NOT NULL DEFAULT 8, PRIMARY KEY(user_id,id));
   CREATE TABLE IF NOT EXISTS product_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, detail TEXT NOT NULL, category TEXT NOT NULL, cost REAL NOT NULL DEFAULT 0, price REAL NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 0, min INTEGER NOT NULL DEFAULT 8);
@@ -27,6 +27,7 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS account_orders (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, customer_name TEXT NOT NULL, phone TEXT NOT NULL, fulfillment TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', items TEXT NOT NULL, total REAL NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL, PRIMARY KEY(user_id,id));
 `);
 if (!db.prepare('PRAGMA table_info(users)').all().some(column=>column.name==='role')) db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'");
+if (!db.prepare('PRAGMA table_info(users)').all().some(column=>column.name==='store_owner_id')) db.exec('ALTER TABLE users ADD COLUMN store_owner_id TEXT REFERENCES users(id) ON DELETE CASCADE');
 if (!db.prepare('PRAGMA table_info(account_orders)').all().some(column=>column.name==='customer_user_id')) db.exec('ALTER TABLE account_orders ADD COLUMN customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL');
 db.exec('CREATE INDEX IF NOT EXISTS account_orders_customer_idx ON account_orders(customer_user_id,created_at DESC)');
 const seedItems = [
@@ -48,6 +49,7 @@ if (db.prepare('SELECT COUNT(*) count FROM product_templates').get().count === 0
 }
 
 const safeUser = user => ({id:user.id,name:user.name,username:user.username,email:user.email||'',phone:user.phone||'',role:user.role||'owner'});
+const storeId = user => user.store_owner_id || user.id;
 const cookieName = 'jomitch_session';
 const hashToken = token => createHash('sha256').update(token).digest('hex');
 const cookieValue = req => (req.headers.cookie||'').split(';').map(s=>s.trim()).find(s=>s.startsWith(`${cookieName}=`))?.slice(cookieName.length+1);
@@ -80,12 +82,16 @@ function writeState(userId,state) {
     db.exec('COMMIT');
   } catch(e){db.exec('ROLLBACK');throw e;}
 }
+function writeInventory(userId,items) {
+  if(!Array.isArray(items))throw new Error('Invalid inventory payload');
+  db.exec('BEGIN IMMEDIATE');try{db.prepare('DELETE FROM account_products WHERE user_id=?').run(userId);const insert=db.prepare('INSERT INTO account_products(user_id,id,name,detail,category,cost,price,qty,min) VALUES(?,?,?,?,?,?,?,?,?)');for(const x of items)insert.run(userId,String(x.id),String(x.name),String(x.detail||''),String(x.category||'Food'),Number(x.cost)||0,Number(x.price)||0,Math.max(0,Number(x.qty)||0),Math.max(0,Number(x.min)||0));db.exec('COMMIT')}catch(e){db.exec('ROLLBACK');throw e;}
+}
 function readState(user) {
-  const id=user.id;
+  const id=storeId(user);
   const items=db.prepare('SELECT id,name,detail,category,cost,price,qty,min FROM account_products WHERE user_id=? ORDER BY rowid DESC').all(id);
   const tx=db.prepare('SELECT id,date,type,product,qty,total FROM account_transactions WHERE user_id=? ORDER BY rowid DESC').all(id);
   const row=db.prepare('SELECT name,email,phone,lowStock,weekly,emailAlerts,push FROM account_settings WHERE user_id=?').get(id);
-  return {items,tx,settings:row?{...row,lowStock:!!row.lowStock,weekly:!!row.weekly,emailAlerts:!!row.emailAlerts,push:!!row.push}:{name:user.name,email:user.email||'',phone:user.phone||'',lowStock:true,weekly:true,emailAlerts:true,push:true}};
+  return {items,tx:user.role==='staff'?[]:tx,settings:row?{...row,lowStock:!!row.lowStock,weekly:!!row.weekly,emailAlerts:!!row.emailAlerts,push:!!row.push}:{name:user.name,email:user.email||'',phone:user.phone||'',lowStock:true,weekly:true,emailAlerts:true,push:true}};
 }
 async function makeSession(userId,res,req) {
   const token=randomBytes(32).toString('base64url');
@@ -102,8 +108,8 @@ const server=createServer(async(req,res)=>{
   if(url.pathname==='/api/auth/me'&&req.method==='GET'){const user=sessionUser(req);return user?sendJson(req,res,200,{user:safeUser(user)}):sendJson(req,res,401,{error:'Please sign in.'});}
   if(url.pathname==='/api/auth/signup'&&req.method==='POST'){
     try{
-      const b=await bodyJson(req),name=String(b.name||'').trim(),username=String(b.username||'').trim().toLowerCase(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim(),password=String(b.password||''),role=b.role==='customer'?'customer':'';
-      if(!role)return sendJson(req,res,403,{error:'Owner accounts are managed by the store. Choose customer registration to create a customer account.'});
+      const owner=sessionUser(req);if(!owner||owner.role!=='owner')return sendJson(req,res,403,{error:'Only the owner can create staff accounts.'});
+      const b=await bodyJson(req),name=String(b.name||'').trim(),username=String(b.username||'').trim().toLowerCase(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim(),password=String(b.password||'');
       if(name.length<2||username.length<3||!/^[a-z0-9_]+$/.test(username)||password.length<8||(!email&&!phone))return sendJson(req,res,400,{error:'Enter your name, a username (letters, numbers, underscore; 3+ characters), a password (8+ characters), and an email or phone number.'});
       if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return sendJson(req,res,400,{error:'Enter a valid email address.'});
       if(phone&&phone.replace(/\D/g,'').length<7)return sendJson(req,res,400,{error:'Enter a valid phone number.'});
@@ -111,12 +117,10 @@ const server=createServer(async(req,res)=>{
       const id=randomBytes(16).toString('hex');
       db.exec('BEGIN IMMEDIATE');
       try{
-        db.prepare('INSERT INTO users(id,name,username,email,phone,password_hash,role) VALUES(?,?,?,?,?,?,?)').run(id,name,username,email||null,phone||null,passwordHash,role);
-        if(role==='owner')db.prepare('INSERT INTO account_products(user_id,id,name,detail,category,cost,price,qty,min) SELECT ?,id,name,detail,category,cost,price,qty,min FROM product_templates').run(id);
-        db.prepare('INSERT INTO account_settings(user_id,name,email,phone) VALUES(?,?,?,?)').run(id,name,email,phone);
+        db.prepare("INSERT INTO users(id,name,username,email,phone,password_hash,role,store_owner_id) VALUES(?,?,?,?,?,?,'staff',?)").run(id,name,username,email||null,phone||null,passwordHash,storeId(owner));
         db.exec('COMMIT');
       }catch(e){db.exec('ROLLBACK');if(String(e.message).includes('UNIQUE'))return sendJson(req,res,409,{error:'That username, email, or phone number is already registered.'});throw e;}
-      await makeSession(id,res,req);const user=db.prepare('SELECT * FROM users WHERE id=?').get(id);return sendJson(req,res,201,{user:safeUser(user)});
+      const user=db.prepare('SELECT * FROM users WHERE id=?').get(id);return sendJson(req,res,201,{user:safeUser(user)});
     }catch(e){return sendJson(req,res,400,{error:e.message||'Could not create account.'});}
   }
   if(url.pathname==='/api/auth/login'&&req.method==='POST'){
@@ -124,7 +128,7 @@ const server=createServer(async(req,res)=>{
       const b=await bodyJson(req),identity=String(b.identity||'').trim(),password=String(b.password||'');
       const user=db.prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE OR email=? COLLATE NOCASE OR phone=?').get(identity,identity.toLowerCase(),identity);
       if(!user)return sendJson(req,res,401,{error:'Username, phone, email, or password is incorrect.'});
-      if(b.role&&user.role!==(b.role==='customer'?'customer':'owner'))return sendJson(req,res,403,{error:b.role==='customer'?'This account is for the owner or store manager.':'This account is for a customer. Choose the customer login.'});
+      if(b.role&&user.role!==(b.role==='staff'?'staff':'owner'))return sendJson(req,res,403,{error:b.role==='staff'?'This account is for the owner or manager. Choose the owner / manager login.':'This account is for staff. Choose the staff login.'});
       const [salt,stored]=user.password_hash.split(':'),actual=await scrypt(password,salt,64);
       if(!stored||!timingSafeEqual(actual,Buffer.from(stored,'hex')))return sendJson(req,res,401,{error:'Username, phone, email, or password is incorrect.'});
       await makeSession(user.id,res,req);return sendJson(req,res,200,{user:safeUser(user)});
@@ -141,7 +145,7 @@ const server=createServer(async(req,res)=>{
   }
   if(url.pathname==='/api/auth/profile'&&req.method==='PUT'){
     const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});
-    try{const b=await bodyJson(req),name=String(b.name||'').trim(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim();if(name.length<2)return sendJson(req,res,400,{error:'Enter your full name.'});if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return sendJson(req,res,400,{error:'Enter a valid email address.'});if(phone&&phone.replace(/\D/g,'').length<7)return sendJson(req,res,400,{error:'Enter a valid phone number.'});try{db.prepare('UPDATE users SET name=?,email=?,phone=? WHERE id=?').run(name,email||null,phone||null,user.id);db.prepare('UPDATE account_settings SET name=?,email=?,phone=? WHERE user_id=?').run(name,email,phone,user.id);}catch(e){if(String(e.message).includes('UNIQUE'))return sendJson(req,res,409,{error:'That email address or phone number is already used by another account.'});throw e;}return sendJson(req,res,200,{ok:true,user:safeUser({...user,name,email,phone})});}catch(e){return sendJson(req,res,400,{error:e.message||'Could not update profile.'});}
+    try{const b=await bodyJson(req);if(b.action==='createStaff'){if(user.role!=='owner')return sendJson(req,res,403,{error:'Only the owner can create staff accounts.'});const name=String(b.name||'').trim(),username=String(b.username||'').trim().toLowerCase(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim(),password=String(b.password||'');if(name.length<2||username.length<3||!/^[a-z0-9_]+$/.test(username)||password.length<8)return sendJson(req,res,400,{error:'Enter a name, username (3+ letters, numbers, or underscore), and password (8+ characters).'});if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return sendJson(req,res,400,{error:'Enter a valid email address.'});if(phone&&phone.replace(/\D/g,'').length<7)return sendJson(req,res,400,{error:'Enter a valid phone number.'});const salt=randomBytes(16).toString('hex'),derived=await scrypt(password,salt,64),id=randomBytes(16).toString('hex');try{db.prepare("INSERT INTO users(id,name,username,email,phone,password_hash,role,store_owner_id) VALUES(?,?,?,?,?,?,'staff',?)").run(id,name,username,email||null,phone||null,`${salt}:${derived.toString('hex')}`,storeId(user));}catch(e){if(String(e.message).includes('UNIQUE'))return sendJson(req,res,409,{error:'That username, email, or phone number is already registered.'});throw e;}return sendJson(req,res,201,{user:safeUser({id,name,username,email,phone,role:'staff'})});}const name=String(b.name||'').trim(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim();if(name.length<2)return sendJson(req,res,400,{error:'Enter your full name.'});if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return sendJson(req,res,400,{error:'Enter a valid email address.'});if(phone&&phone.replace(/\D/g,'').length<7)return sendJson(req,res,400,{error:'Enter a valid phone number.'});try{db.prepare('UPDATE users SET name=?,email=?,phone=? WHERE id=?').run(name,email||null,phone||null,user.id);if(user.role==='owner')db.prepare('UPDATE account_settings SET name=?,email=?,phone=? WHERE user_id=?').run(name,email,phone,user.id);}catch(e){if(String(e.message).includes('UNIQUE'))return sendJson(req,res,409,{error:'That email address or phone number is already used by another account.'});throw e;}return sendJson(req,res,200,{ok:true,user:safeUser({...user,name,email,phone})});}catch(e){return sendJson(req,res,400,{error:e.message||'Could not update profile.'});}
   }
   const shopMatch=url.pathname.match(/^\/api\/shop\/([a-z0-9_]+)(?:\/orders)?$/i);
   if(shopMatch){
@@ -152,9 +156,9 @@ const server=createServer(async(req,res)=>{
     }return sendJson(req,res,405,{error:'Method not allowed.'});
   }
   if(url.pathname==='/api/customer/orders'&&req.method==='GET'){const user=sessionUser(req);if(!user||user.role!=='customer')return sendJson(req,res,403,{error:'Customer sign-in is required.'});const orders=db.prepare('SELECT id,customer_name AS customerName,phone,fulfillment,address,note,items,total,status,created_at AS createdAt FROM account_orders WHERE customer_user_id=? ORDER BY created_at DESC').all(user.id).map(x=>({...x,items:JSON.parse(x.items)}));return sendJson(req,res,200,{orders});}
-  if(url.pathname==='/api/orders'&&req.method==='GET'){const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Manager sign-in is required.'});const orders=db.prepare('SELECT id,customer_name AS customerName,phone,fulfillment,address,note,items,total,status,created_at AS createdAt FROM account_orders WHERE user_id=? ORDER BY created_at DESC').all(user.id).map(x=>({...x,items:JSON.parse(x.items)}));return sendJson(req,res,200,{orders});}
+  if(url.pathname==='/api/orders'&&req.method==='GET'){const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Owner or manager sign-in is required.'});const orders=db.prepare('SELECT id,customer_name AS customerName,phone,fulfillment,address,note,items,total,status,created_at AS createdAt FROM account_orders WHERE user_id=? ORDER BY created_at DESC').all(storeId(user)).map(x=>({...x,items:JSON.parse(x.items)}));return sendJson(req,res,200,{orders});}
   const orderMatch=url.pathname.match(/^\/api\/orders\/([A-Za-z0-9_-]+)$/);
-  if(orderMatch&&req.method==='PUT'){const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Manager sign-in is required.'});try{const {status}=await bodyJson(req);if(!['Confirmed','Cancelled'].includes(status))return sendJson(req,res,400,{error:'Choose Confirmed or Cancelled.'});db.exec('BEGIN IMMEDIATE');try{const order=db.prepare('SELECT * FROM account_orders WHERE user_id=? AND id=?').get(user.id,orderMatch[1]);if(!order){db.exec('ROLLBACK');return sendJson(req,res,404,{error:'Order not found.'});}if(order.status!=='Pending'){db.exec('ROLLBACK');return sendJson(req,res,409,{error:'This order has already been processed.'});}if(status==='Confirmed'){for(const line of JSON.parse(order.items)){const result=db.prepare('UPDATE account_products SET qty=qty-? WHERE user_id=? AND id=? AND qty>=?').run(line.qty,user.id,line.id,line.qty);if(!result.changes)throw new Error(`Not enough stock for ${line.name}. Cancel this order or update the inventory first.`);db.prepare('INSERT INTO account_transactions(user_id,id,date,type,product,qty,total) VALUES(?,?,?,?,?,?,?)').run(user.id,`WEB-${order.id}-${line.id}`,new Date().toISOString().slice(0,10),'Sale',line.name,-line.qty,line.subtotal);}}db.prepare('UPDATE account_orders SET status=? WHERE user_id=? AND id=?').run(status,user.id,order.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return sendJson(req,res,200,{ok:true,state:readState(user)});}catch(e){return sendJson(req,res,409,{error:e.message||'Could not process order.'});}}
+  if(orderMatch&&req.method==='PUT'){const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Owner or manager sign-in is required.'});const accountId=storeId(user);try{const {status}=await bodyJson(req);if(!['Confirmed','Cancelled'].includes(status))return sendJson(req,res,400,{error:'Choose Confirmed or Cancelled.'});db.exec('BEGIN IMMEDIATE');try{const order=db.prepare('SELECT * FROM account_orders WHERE user_id=? AND id=?').get(accountId,orderMatch[1]);if(!order){db.exec('ROLLBACK');return sendJson(req,res,404,{error:'Order not found.'});}if(order.status!=='Pending'){db.exec('ROLLBACK');return sendJson(req,res,409,{error:'This order has already been processed.'});}if(status==='Confirmed'){for(const line of JSON.parse(order.items)){const result=db.prepare('UPDATE account_products SET qty=qty-? WHERE user_id=? AND id=? AND qty>=?').run(line.qty,accountId,line.id,line.qty);if(!result.changes)throw new Error(`Not enough stock for ${line.name}. Cancel this order or update the inventory first.`);db.prepare('INSERT INTO account_transactions(user_id,id,date,type,product,qty,total) VALUES(?,?,?,?,?,?,?)').run(accountId,`WEB-${order.id}-${line.id}`,new Date().toISOString().slice(0,10),'Sale',line.name,-line.qty,line.subtotal);}}db.prepare('UPDATE account_orders SET status=? WHERE user_id=? AND id=?').run(status,accountId,order.id);db.exec('COMMIT');}catch(e){db.exec('ROLLBACK');throw e;}return sendJson(req,res,200,{ok:true,state:readState(user)});}catch(e){return sendJson(req,res,409,{error:e.message||'Could not process order.'});}}
   if(url.pathname==='/api/backup'){
     const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Owner sign-in is required.'});
     if(req.method==='GET')return sendJson(req,res,200,{format:'jomitch-account-backup',version:1,exportedAt:new Date().toISOString(),state:readState(user)});
@@ -164,10 +168,10 @@ const server=createServer(async(req,res)=>{
     }
   }
   if(url.pathname.startsWith('/api/state')){
-    const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(user.role!=='owner')return sendJson(req,res,403,{error:'Owner sign-in is required.'});
+    const user=sessionUser(req);if(!user)return sendJson(req,res,401,{error:'Please sign in.'});if(!['owner','staff'].includes(user.role))return sendJson(req,res,403,{error:'Staff sign-in is required.'});
     if(url.pathname==='/api/state'&&req.method==='GET')return sendJson(req,res,200,readState(user));
     if(url.pathname==='/api/state'&&req.method==='PUT'){
-      try{writeState(user.id,await bodyJson(req));return sendJson(req,res,200,{ok:true});}catch(e){return sendJson(req,res,400,{error:e.message});}
+      try{const body=await bodyJson(req);if(user.role==='staff')writeInventory(storeId(user),body.items);else writeState(storeId(user),body);return sendJson(req,res,200,{ok:true});}catch(e){return sendJson(req,res,400,{error:e.message});}
     }
   }
   if(req.method!=='GET'&&req.method!=='HEAD')return sendJson(req,res,405,{error:'Method not allowed'});
