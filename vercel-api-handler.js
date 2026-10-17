@@ -9,7 +9,7 @@ globalThis.__jomitchPgPool = pool;
 const init = globalThis.__jomitchSchemaInit || (globalThis.__jomitchSchemaInit = initialize());
 const cookieName = 'jomitch_session';
 const hashToken = token => createHash('sha256').update(token).digest('hex');
-const safeUser = user => ({id:user.id,name:user.name,username:user.username,email:user.email||'',phone:user.phone||''});
+const safeUser = user => ({id:user.id,name:user.name,username:user.username,email:user.email||'',phone:user.phone||'',role:user.role||'owner'});
 
 const seedItems = [
   ['P-1001','Monello Cat Adult','1 kg · Cat food','Food',118,160,24,8], ['P-1002','Monello Kitten','1 kg · Cat food','Food',130,185,18,8],
@@ -21,13 +21,16 @@ const seedItems = [
 async function initialize() {
   if (!databaseUrl) throw new Error('DATABASE_URL is not configured. Connect a Postgres database in Vercel.');
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL UNIQUE, email TEXT UNIQUE, phone TEXT UNIQUE, password_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL UNIQUE, email TEXT UNIQUE, phone TEXT UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'owner', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at BIGINT NOT NULL);
     CREATE TABLE IF NOT EXISTS product_templates (id TEXT PRIMARY KEY, name TEXT NOT NULL, detail TEXT NOT NULL, category TEXT NOT NULL, cost DOUBLE PRECISION NOT NULL DEFAULT 0, price DOUBLE PRECISION NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 0, min INTEGER NOT NULL DEFAULT 8);
     CREATE TABLE IF NOT EXISTS account_products (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, name TEXT NOT NULL, detail TEXT NOT NULL, category TEXT NOT NULL, cost DOUBLE PRECISION NOT NULL DEFAULT 0, price DOUBLE PRECISION NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 0, min INTEGER NOT NULL DEFAULT 8, PRIMARY KEY(user_id,id));
     CREATE TABLE IF NOT EXISTS account_transactions (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, date TEXT NOT NULL, type TEXT NOT NULL, product TEXT NOT NULL, qty INTEGER NOT NULL, total DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY(user_id,id));
     CREATE TABLE IF NOT EXISTS account_settings (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', low_stock BOOLEAN NOT NULL DEFAULT TRUE, weekly BOOLEAN NOT NULL DEFAULT TRUE, email_alerts BOOLEAN NOT NULL DEFAULT TRUE, push BOOLEAN NOT NULL DEFAULT TRUE);
-    CREATE TABLE IF NOT EXISTS account_orders (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, customer_name TEXT NOT NULL, phone TEXT NOT NULL, fulfillment TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', items JSONB NOT NULL, total DOUBLE PRECISION NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(user_id,id));
+    CREATE TABLE IF NOT EXISTS account_orders (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, customer_name TEXT NOT NULL, phone TEXT NOT NULL, fulfillment TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', items JSONB NOT NULL, total DOUBLE PRECISION NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL, PRIMARY KEY(user_id,id));
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'owner';
+    ALTER TABLE account_orders ADD COLUMN IF NOT EXISTS customer_user_id TEXT REFERENCES users(id) ON DELETE SET NULL;
+    CREATE INDEX IF NOT EXISTS account_orders_customer_idx ON account_orders(customer_user_id,created_at DESC);
   `);
   const count = await pool.query('SELECT COUNT(*)::int AS count FROM product_templates');
   if (count.rows[0].count === 0) {
@@ -95,22 +98,24 @@ export default async function handler(req,res) {
       const user=await currentUser(req);return user?send(res,200,{user:safeUser(user)}):send(res,401,{error:'Please sign in.'});
     }
     if(pathname==='/api/auth/signup'&&req.method==='POST'){
-      const b=await readBody(req),name=String(b.name||'').trim(),username=String(b.username||'').trim().toLowerCase(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim(),password=String(b.password||'');
+      const b=await readBody(req),name=String(b.name||'').trim(),username=String(b.username||'').trim().toLowerCase(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim(),password=String(b.password||''),role=b.role==='customer'?'customer':'';
+      if(!role)return send(res,403,{error:'Owner accounts are managed by the store. Choose customer registration to create a customer account.'});
       if(name.length<2||username.length<3||!/^[a-z0-9_]+$/.test(username)||password.length<8||(!email&&!phone))return send(res,400,{error:'Enter your name, a username (letters, numbers, underscore; 3+ characters), a password (8+ characters), and an email or phone number.'});
       if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return send(res,400,{error:'Enter a valid email address.'});
       if(phone&&phone.replace(/\D/g,'').length<7)return send(res,400,{error:'Enter a valid phone number.'});
       const salt=randomBytes(16).toString('hex'),derived=await scrypt(password,salt,64),id=randomBytes(16).toString('hex');
       try{
-        await pool.query('INSERT INTO users(id,name,username,email,phone,password_hash) VALUES($1,$2,$3,$4,$5,$6)',[id,name,username,email||null,phone||null,`${salt}:${derived.toString('hex')}`]);
-        await pool.query('INSERT INTO account_products(user_id,id,name,detail,category,cost,price,qty,min) SELECT $1,id,name,detail,category,cost,price,qty,min FROM product_templates',[id]);
+        await pool.query('INSERT INTO users(id,name,username,email,phone,password_hash,role) VALUES($1,$2,$3,$4,$5,$6,$7)',[id,name,username,email||null,phone||null,`${salt}:${derived.toString('hex')}`,role]);
+        if(role==='owner')await pool.query('INSERT INTO account_products(user_id,id,name,detail,category,cost,price,qty,min) SELECT $1,id,name,detail,category,cost,price,qty,min FROM product_templates',[id]);
         await pool.query('INSERT INTO account_settings(user_id,name,email,phone) VALUES($1,$2,$3,$4)',[id,name,email,phone]);
       }catch(e){await pool.query('DELETE FROM users WHERE id=$1',[id]);if(e.code==='23505')return send(res,409,{error:'That username, email, or phone number is already registered.'});throw e;}
-      await setSession(id,res);return send(res,201,{user:safeUser({id,name,username,email,phone})});
+      await setSession(id,res);return send(res,201,{user:safeUser({id,name,username,email,phone,role})});
     }
     if(pathname==='/api/auth/login'&&req.method==='POST'){
       const b=await readBody(req),identity=String(b.identity||'').trim(),password=String(b.password||'');
       const result=await pool.query('SELECT * FROM users WHERE lower(username)=lower($1) OR lower(email)=lower($1) OR phone=$1 LIMIT 1',[identity]);const user=result.rows[0];
       if(!user)return send(res,401,{error:'Username, phone, email, or password is incorrect.'});
+      if(b.role&&user.role!==(b.role==='customer'?'customer':'owner'))return send(res,403,{error:b.role==='customer'?'This account is for the owner or store manager.':'This account is for a customer. Choose the customer login.'});
       const [salt,stored]=user.password_hash.split(':'),actual=await scrypt(password,salt,64);
       if(!stored||!timingSafeEqual(actual,Buffer.from(stored,'hex')))return send(res,401,{error:'Username, phone, email, or password is incorrect.'});
       await setSession(user.id,res);return send(res,200,{user:safeUser(user)});
@@ -142,7 +147,7 @@ export default async function handler(req,res) {
     const shopMatch=pathname.match(/^\/api\/shop\/([a-z0-9_]+)(?:\/orders)?$/i);
     if(shopMatch){
       const slug=shopMatch[1].toLowerCase(),orderEndpoint=pathname.endsWith('/orders');
-      const ownerResult=await pool.query('SELECT id,name,username FROM users WHERE lower(username)=lower($1) LIMIT 1',[slug]);
+      const ownerResult=await pool.query("SELECT id,name,username FROM users WHERE lower(username)=lower($1) AND role='owner' LIMIT 1",[slug]);
       const owner=ownerResult.rows[0];if(!owner)return send(res,404,{error:'Shop not found.'});
       if(!orderEndpoint&&req.method==='GET'){
         const [products,settings]=await Promise.all([
@@ -161,19 +166,25 @@ export default async function handler(req,res) {
         const byId=new Map(result.rows.map(p=>[p.id,p]));const lines=[];let total=0;
         for(const [id,qty] of requested){const product=byId.get(id);if(qty>product.qty)return send(res,409,{error:`Only ${product.qty} unit(s) of ${product.name} are currently available.`});const subtotal=Number(product.price)*qty;total+=subtotal;lines.push({id,name:product.name,price:Number(product.price),qty,subtotal});}
         const orderId=`ORD-${Date.now().toString(36).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`;
-        await pool.query('INSERT INTO account_orders(user_id,id,customer_name,phone,fulfillment,address,note,items,total,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)',[owner.id,orderId,name,phone,fulfillment,address,note,JSON.stringify(lines),total,'Pending']);
+        const signedIn=await currentUser(req),customerUserId=signedIn?.role==='customer'?signedIn.id:null;
+        await pool.query('INSERT INTO account_orders(user_id,id,customer_name,phone,fulfillment,address,note,items,total,status,customer_user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11)',[owner.id,orderId,name,phone,fulfillment,address,note,JSON.stringify(lines),total,'Pending',customerUserId]);
         return send(res,201,{ok:true,order:{id:orderId,total,status:'Pending'}});
       }
       return send(res,405,{error:'Method not allowed.'});
     }
+    if(pathname==='/api/customer/orders'&&req.method==='GET'){
+      const user=await currentUser(req);if(!user||user.role!=='customer')return send(res,403,{error:'Customer sign-in is required.'});
+      const result=await pool.query('SELECT id,customer_name AS "customerName",phone,fulfillment,address,note,items,total,status,created_at AS "createdAt" FROM account_orders WHERE customer_user_id=$1 ORDER BY created_at DESC',[user.id]);
+      return send(res,200,{orders:result.rows});
+    }
     if(pathname==='/api/orders'&&req.method==='GET'){
-      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});if(user.role!=='owner')return send(res,403,{error:'Manager sign-in is required.'});
       const result=await pool.query('SELECT id,customer_name AS "customerName",phone,fulfillment,address,note,items,total,status,created_at AS "createdAt" FROM account_orders WHERE user_id=$1 ORDER BY created_at DESC',[user.id]);
       return send(res,200,{orders:result.rows});
     }
     const orderMatch=pathname.match(/^\/api\/orders\/([A-Za-z0-9_-]+)$/);
     if(orderMatch&&req.method==='PUT'){
-      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});if(user.role!=='owner')return send(res,403,{error:'Manager sign-in is required.'});
       const {status}=await readBody(req);if(!['Confirmed','Cancelled'].includes(status))return send(res,400,{error:'Choose Confirmed or Cancelled.'});
       const client=await pool.connect();
       try{
@@ -195,6 +206,7 @@ export default async function handler(req,res) {
     }
     if(pathname==='/api/backup'){
       const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      if(user.role!=='owner')return send(res,403,{error:'Owner sign-in is required.'});
       if(req.method==='GET')return send(res,200,{format:'jomitch-account-backup',version:1,exportedAt:new Date().toISOString(),state:await loadState(user)});
       if(req.method==='PUT'){
         const backup=await readBody(req);if(backup.format!=='jomitch-account-backup'||backup.version!==1)throw new Error('This backup file is not supported.');
@@ -203,6 +215,7 @@ export default async function handler(req,res) {
     }
     if(pathname==='/api/state'){
       const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      if(user.role!=='owner')return send(res,403,{error:'Owner sign-in is required.'});
       if(req.method==='GET')return send(res,200,await loadState(user));
       if(req.method==='PUT'){await saveState(user.id,await readBody(req));return send(res,200,{ok:true});}
     }
