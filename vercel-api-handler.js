@@ -27,6 +27,7 @@ async function initialize() {
     CREATE TABLE IF NOT EXISTS account_products (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, name TEXT NOT NULL, detail TEXT NOT NULL, category TEXT NOT NULL, cost DOUBLE PRECISION NOT NULL DEFAULT 0, price DOUBLE PRECISION NOT NULL DEFAULT 0, qty INTEGER NOT NULL DEFAULT 0, min INTEGER NOT NULL DEFAULT 8, PRIMARY KEY(user_id,id));
     CREATE TABLE IF NOT EXISTS account_transactions (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, date TEXT NOT NULL, type TEXT NOT NULL, product TEXT NOT NULL, qty INTEGER NOT NULL, total DOUBLE PRECISION NOT NULL DEFAULT 0, PRIMARY KEY(user_id,id));
     CREATE TABLE IF NOT EXISTS account_settings (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, email TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', low_stock BOOLEAN NOT NULL DEFAULT TRUE, weekly BOOLEAN NOT NULL DEFAULT TRUE, email_alerts BOOLEAN NOT NULL DEFAULT TRUE, push BOOLEAN NOT NULL DEFAULT TRUE);
+    CREATE TABLE IF NOT EXISTS account_orders (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, id TEXT NOT NULL, customer_name TEXT NOT NULL, phone TEXT NOT NULL, fulfillment TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', items JSONB NOT NULL, total DOUBLE PRECISION NOT NULL, status TEXT NOT NULL DEFAULT 'Pending', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(user_id,id));
   `);
   const count = await pool.query('SELECT COUNT(*)::int AS count FROM product_templates');
   if (count.rows[0].count === 0) {
@@ -117,6 +118,80 @@ export default async function handler(req,res) {
     if(pathname==='/api/auth/logout'&&req.method==='POST'){
       const token=rawSession(req);if(token)await pool.query('DELETE FROM sessions WHERE token_hash=$1',[hashToken(token)]);
       return send(res,200,{ok:true},{'set-cookie':`${cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure`});
+    }
+    if(pathname==='/api/auth/password'&&req.method==='PUT'){
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const b=await readBody(req),current=String(b.currentPassword||''),next=String(b.newPassword||'');
+      if(next.length<8)return send(res,400,{error:'New password must be at least 8 characters.'});
+      const [salt,stored]=user.password_hash.split(':'),actual=await scrypt(current,salt,64);
+      if(!stored||!timingSafeEqual(actual,Buffer.from(stored,'hex')))return send(res,401,{error:'Current password is incorrect.'});
+      const nextSalt=randomBytes(16).toString('hex'),derived=await scrypt(next,nextSalt,64);
+      await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2',[`${nextSalt}:${derived.toString('hex')}`,user.id]);
+      return send(res,200,{ok:true});
+    }
+    if(pathname==='/api/auth/profile'&&req.method==='PUT'){
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const b=await readBody(req),name=String(b.name||'').trim(),email=String(b.email||'').trim().toLowerCase(),phone=String(b.phone||'').trim();
+      if(name.length<2)return send(res,400,{error:'Enter your full name.'});
+      if(email&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return send(res,400,{error:'Enter a valid email address.'});
+      if(phone&&phone.replace(/\D/g,'').length<7)return send(res,400,{error:'Enter a valid phone number.'});
+      try{await pool.query('UPDATE users SET name=$1,email=$2,phone=$3 WHERE id=$4',[name,email||null,phone||null,user.id]);await pool.query('UPDATE account_settings SET name=$1,email=$2,phone=$3 WHERE user_id=$4',[name,email,phone,user.id]);}
+      catch(e){if(e.code==='23505')return send(res,409,{error:'That email address or phone number is already used by another account.'});throw e;}
+      return send(res,200,{ok:true,user:safeUser({...user,name,email,phone})});
+    }
+    const shopMatch=pathname.match(/^\/api\/shop\/([a-z0-9_]+)(?:\/orders)?$/i);
+    if(shopMatch){
+      const slug=shopMatch[1].toLowerCase(),orderEndpoint=pathname.endsWith('/orders');
+      const ownerResult=await pool.query('SELECT id,name,username FROM users WHERE lower(username)=lower($1) LIMIT 1',[slug]);
+      const owner=ownerResult.rows[0];if(!owner)return send(res,404,{error:'Shop not found.'});
+      if(!orderEndpoint&&req.method==='GET'){
+        const [products,settings]=await Promise.all([
+          pool.query('SELECT id,name,detail,category,price,qty FROM account_products WHERE user_id=$1 AND qty>0 ORDER BY name,id',[owner.id]),
+          pool.query('SELECT name FROM account_settings WHERE user_id=$1',[owner.id]),
+        ]);
+        return send(res,200,{shop:{name:owner.username.toLowerCase()==='jomich'?'Jomich Petshop':`${settings.rows[0]?.name||owner.name}'s Petshop`,username:owner.username},products:products.rows});
+      }
+      if(orderEndpoint&&req.method==='POST'){
+        const b=await readBody(req),name=String(b.name||'').trim(),phone=String(b.phone||'').trim(),fulfillment=String(b.fulfillment||''),address=String(b.address||'').trim(),note=String(b.note||'').trim();
+        if(name.length<2||phone.replace(/\D/g,'').length<7||!['Pickup','Delivery'].includes(fulfillment)||(fulfillment==='Delivery'&&address.length<8))return send(res,400,{error:'Enter your name, a valid phone number, and delivery address when delivery is selected.'});
+        if(!Array.isArray(b.items)||!b.items.length||b.items.length>30)return send(res,400,{error:'Add at least one product to your cart.'});
+        const requested=new Map();for(const item of b.items){const id=String(item.id||''),qty=Number(item.qty);if(!id||!Number.isInteger(qty)||qty<1||qty>1000)return send(res,400,{error:'Check product quantities and try again.'});requested.set(id,(requested.get(id)||0)+qty);}
+        const ids=[...requested.keys()],result=await pool.query('SELECT id,name,price,qty FROM account_products WHERE user_id=$1 AND id=ANY($2::text[])',[owner.id,ids]);
+        if(result.rows.length!==ids.length)return send(res,400,{error:'A product in your cart is no longer available.'});
+        const byId=new Map(result.rows.map(p=>[p.id,p]));const lines=[];let total=0;
+        for(const [id,qty] of requested){const product=byId.get(id);if(qty>product.qty)return send(res,409,{error:`Only ${product.qty} unit(s) of ${product.name} are currently available.`});const subtotal=Number(product.price)*qty;total+=subtotal;lines.push({id,name:product.name,price:Number(product.price),qty,subtotal});}
+        const orderId=`ORD-${Date.now().toString(36).toUpperCase()}-${randomBytes(3).toString('hex').toUpperCase()}`;
+        await pool.query('INSERT INTO account_orders(user_id,id,customer_name,phone,fulfillment,address,note,items,total,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)',[owner.id,orderId,name,phone,fulfillment,address,note,JSON.stringify(lines),total,'Pending']);
+        return send(res,201,{ok:true,order:{id:orderId,total,status:'Pending'}});
+      }
+      return send(res,405,{error:'Method not allowed.'});
+    }
+    if(pathname==='/api/orders'&&req.method==='GET'){
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const result=await pool.query('SELECT id,customer_name AS "customerName",phone,fulfillment,address,note,items,total,status,created_at AS "createdAt" FROM account_orders WHERE user_id=$1 ORDER BY created_at DESC',[user.id]);
+      return send(res,200,{orders:result.rows});
+    }
+    const orderMatch=pathname.match(/^\/api\/orders\/([A-Za-z0-9_-]+)$/);
+    if(orderMatch&&req.method==='PUT'){
+      const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});
+      const {status}=await readBody(req);if(!['Confirmed','Cancelled'].includes(status))return send(res,400,{error:'Choose Confirmed or Cancelled.'});
+      const client=await pool.connect();
+      try{
+        await client.query('BEGIN');
+        const orderResult=await client.query('SELECT * FROM account_orders WHERE user_id=$1 AND id=$2 FOR UPDATE',[user.id,orderMatch[1]]),order=orderResult.rows[0];
+        if(!order){await client.query('ROLLBACK');return send(res,404,{error:'Order not found.'});}
+        if(order.status!=='Pending'){await client.query('ROLLBACK');return send(res,409,{error:'This order has already been processed.'});}
+        if(status==='Confirmed'){
+          for(const line of order.items){
+            const updated=await client.query('UPDATE account_products SET qty=qty-$1 WHERE user_id=$2 AND id=$3 AND qty >= $1 RETURNING qty',[line.qty,user.id,line.id]);
+            if(!updated.rowCount)throw new Error(`Not enough stock for ${line.name}. Cancel this order or update the inventory first.`);
+            await client.query('INSERT INTO account_transactions(user_id,id,date,type,product,qty,total) VALUES($1,$2,$3,$4,$5,$6,$7)',[user.id,`WEB-${order.id}-${line.id}`,new Date().toISOString().slice(0,10),'Sale',line.name,-line.qty,line.subtotal]);
+          }
+        }
+        await client.query('UPDATE account_orders SET status=$1 WHERE user_id=$2 AND id=$3',[status,user.id,order.id]);
+        await client.query('COMMIT');
+      }catch(error){await client.query('ROLLBACK');return send(res,409,{error:error.message||'Could not process order.'});}finally{client.release();}
+      return send(res,200,{ok:true,state:await loadState(user)});
     }
     if(pathname==='/api/backup'){
       const user=await currentUser(req);if(!user)return send(res,401,{error:'Please sign in.'});

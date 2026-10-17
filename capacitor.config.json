@@ -1,0 +1,10 @@
+{
+  "appId": "com.jomich.petshop",
+  "appName": "Jomich Petshop",
+  "webDir": "dist",
+  "server": {
+    "url": "https://praktispraktis.vercel.app/shop/jomich",
+    "cleartext": false,
+    "allowNavigation": ["praktispraktis.vercel.app"]
+  }
+}
