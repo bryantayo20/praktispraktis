@@ -1,0 +1,21 @@
+{
+  "name": "jomitch-petshop-system",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "dev:database": "node server.js --port=4174",
+    "build": "vite build",
+    "start": "npm run build && node server.js",
+    "preview": "node server.js"
+  },
+  "dependencies": {
+    "bootstrap": "^5.3.8",
+    "bootstrap-icons": "^1.13.1",
+    "pg": "^8.23.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "vite": "^7.1.0"
+  }
+}
