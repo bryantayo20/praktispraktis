@@ -1,0 +1,13 @@
+data/
+work/
+outputs/
+node_modules/
+dist/
+.npm-cache/
+.git/
+.vercel/
+.env
+.env.*
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
